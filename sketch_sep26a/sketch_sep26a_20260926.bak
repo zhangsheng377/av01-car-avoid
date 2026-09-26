@@ -1,0 +1,142 @@
+#include <Servo.h>  // 引入舵机库
+Servo myservo;      // 创建舵机对象
+
+int Trig = 12;  // 超声波Trig引脚连接到数字引脚12
+int Echo = 13;  // 超声波Echo引脚连接到数字引脚13
+
+#define ENA 5  // 电机A使能引脚（PWM控制速度）
+#define ENB 6  // 电机B使能引脚（PWM控制速度）
+#define IN1 3  // 电机A控制引脚1
+#define IN2 4  // 电机A控制引脚2
+#define IN3 2  // 电机B控制引脚1
+#define IN4 7  // 电机B控制引脚2
+
+#define carSpeed 130                                          // 定义小车前进速度（PWM值）
+int rightDistance = 0, leftDistance = 0, middleDistance = 0;  // 存储三个方向的距离
+
+// 前进函数
+void forward() {
+  analogWrite(ENA, carSpeed);  // 设置电机A速度
+  analogWrite(ENB, carSpeed);  // 设置电机B速度
+
+  digitalWrite(IN1, HIGH);  // 电机A正转
+  digitalWrite(IN2, LOW);   // 电机A反转引脚低电平
+
+  digitalWrite(IN3, HIGH);  // 电机B正转
+  digitalWrite(IN4, LOW);   // 电机B反转引脚低电平
+}
+
+// 后退函数
+void back() {
+  analogWrite(ENA, carSpeed);  // 设置电机A速度
+  analogWrite(ENB, carSpeed);  // 设置电机B速度
+  digitalWrite(IN1, LOW);      // 电机A正转引脚低电平
+  digitalWrite(IN2, HIGH);     // 电机A反转
+  digitalWrite(IN3, LOW);      // 电机B正转引脚低电平
+  digitalWrite(IN4, HIGH);     // 电机B反转
+}
+
+// 左转函数
+void left() {
+  analogWrite(ENA, 200);    // 设置电机A速度（较高速度）
+  analogWrite(ENB, 200);    // 设置电机B速度（较高速度）
+  digitalWrite(IN1, LOW);   // 电机A反转
+  digitalWrite(IN2, HIGH);  // 电机A反转
+
+  digitalWrite(IN3, HIGH);  // 电机B正转
+  digitalWrite(IN4, LOW);   // 电机B正转
+}
+
+// 右转函数
+void right() {
+  analogWrite(ENA, 200);    // 设置电机A速度（较高速度）
+  analogWrite(ENB, 200);    // 设置电机B速度（较高速度）
+  digitalWrite(IN1, HIGH);  // 电机A正转
+  digitalWrite(IN2, LOW);   // 电机A正转
+  digitalWrite(IN3, LOW);   // 电机B反转
+  digitalWrite(IN4, HIGH);  // 电机B反转
+}
+
+// 停止函数
+void stop() {
+  digitalWrite(ENA, LOW);  // 关闭电机A
+  digitalWrite(ENB, LOW);  // 关闭电机B
+}
+
+// 获取距离函数
+float GetDistance() {
+  float distance;  // 存储测量距离
+
+  digitalWrite(Trig, LOW);   // 先拉低Trig引脚
+  delayMicroseconds(2);      // 等待2微秒
+  digitalWrite(Trig, HIGH);  // 拉高Trig引脚10微秒，触发超声波
+  delayMicroseconds(10);
+  digitalWrite(Trig, LOW);                 // 拉低Trig引脚
+  distance = pulseIn(Echo, HIGH) / 58.00;  // 计算距离（单位：厘米）
+
+  Serial.print("Distance = ");  // 串口输出距离
+  Serial.println(distance);
+  return distance;  // 返回距离值
+}
+
+// 初始化设置
+void setup() {
+  myservo.attach(A0, 700, 2400);  // 舵机连接到A0引脚，设置脉冲宽度范围
+  Serial.begin(9600);             // 初始化串口通信，波特率9600
+  pinMode(Echo, INPUT);           // 设置Echo引脚为输入模式
+  pinMode(Trig, OUTPUT);          // 设置Trig引脚为输出模式
+  pinMode(IN1, OUTPUT);           // 设置电机控制引脚为输出模式
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  stop();             // 初始状态停止电机
+  myservo.write(90);  // 舵机初始位置为90度（正前方）
+  delay(100);         // 等待100毫秒
+}
+
+// 主循环
+void loop() {
+  middleDistance = GetDistance();  // 测量前方距离
+  if (middleDistance <= 18)        // 如果前方距离小于等于18厘米
+  {
+    stop();                         // 停止
+    delay(500);                     // 等待500毫秒
+    myservo.write(10);              // 舵机转向右侧（10度）
+    delay(500);                     // 等待舵机转动
+    rightDistance = GetDistance();  // 测量右侧距离
+
+    delay(500);                    // 等待500毫秒
+    myservo.write(90);             // 舵机回到中间位置
+    delay(500);                    // 等待舵机转动
+    myservo.write(170);            // 舵机转向左侧（170度）
+    delay(500);                    // 等待舵机转动
+    leftDistance = GetDistance();  // 测量左侧距离
+
+    delay(500);         // 等待500毫秒
+    myservo.write(90);  // 舵机回到中间位置（正前方）
+    delay(500);         // 等待舵机转动
+
+    if (rightDistance > leftDistance)  // 如果右侧距离大于左侧
+    {
+      back();                                 // 后退
+      delay(300);                             // 后退300毫秒
+      right();                                // 右转
+      delay(500);                             // 右转500毫秒
+    } else if (rightDistance < leftDistance)  // 如果左侧距离大于右侧
+    {
+      back();      // 后退
+      delay(300);  // 后退300毫秒
+      left();      // 左转
+      delay(500);  // 左转500毫秒
+    } else         // 如果左右距离相等
+    {
+      forward();  // 前进
+    }
+  } else  // 如果前方距离大于18厘米
+  {
+    forward();  // 继续前进
+  }
+}
