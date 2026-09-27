@@ -26,10 +26,16 @@ Servo myservo;
 #define RANGE_MAX    100         // beyond this => no obstacle
 #define OCC_MAX      15          // occupancy count saturation
 
+// ==================== Body width & passable-channel ====================
+#define CAR_WIDTH    15          // car body width cm
+#define CLEAR_MARGIN 4           // extra side clearance cm
+#define PASS_SECTORS 3           // contiguous open sectors for a passable channel
+                                 // (center + 1 each side => ~45deg window)
+
 // ==================== Control params ====================
-#define WALL_STOP    12          // emergency-stop guard distance cm
-#define TURN_DIST    25          // near => stop and turn
-#define SLOW_DIST    40          // medium => decelerate
+#define WALL_STOP    16          // emergency-stop guard distance cm
+#define TURN_DIST    32          // near => stop and turn
+#define SLOW_DIST    48          // medium => decelerate
 #define HYST         6           // decel->forward hysteresis band
 #define DEAD_ZONE    15          // turn dead-zone (deg from straight)
 #define FREESPACE    20          // verify distance after turn cm
@@ -46,9 +52,13 @@ Servo myservo;
 #define MATCH_MAX_PAIR_DIFF 3     // max avg per-pair diff cm (reliability b)
 #define MATCH_MARGIN        2     // best vs second-best err gap (peak sharpness)
 
-// ==================== Disengage ====================
+// ==================== Disengage / stuck watchdog ====================
 #define DISENGAGE_MS        600   // disengage reverse duration ms
 #define DISENGAGE_MAX       3     // disengage trigger cap, beyond => double reverse
+#define STUCK_TIMEOUT       2500  // ms without forward progress => force disengage
+#define STUCK_MAX           8     // per-sector stuck-count saturation
+#define HALT_TIMEOUT        1500  // ms dead-stopped at wall before forced reverse
+#define PROGRESS_DELTA      4     // cm of nearest-obstacle change => real displacement
 
 // ==================== States ====================
 #define ST_SCAN      1
@@ -89,6 +99,12 @@ uint8_t matchReliable = 0;        // 1  B  0=unreliable 1=reliable
 uint8_t capScanIdx   = 0;         // 1  B  parked static-sweep sample index
 uint8_t disengCount  = 0;         // 1  B  disengage trigger count
 unsigned long disengUntilMs = 0;  // 4  B  disengage end timestamp
+
+// ==================== Iterative stuck-learning globals ====================
+uint8_t stuck[SECTOR_N];          // 12 B  decayed per-sector stuck counter
+unsigned long lastProgressMs = 0; // 4  B  last time real forward progress happened
+unsigned long haltStartMs = 0;    // 4  B  when the wall-halt began (HALT_TIMEOUT base)
+uint8_t lastProgNearest = 0;      // 1  B  nearest-obstacle distance at last progress event
 
 // ==================== Motor drivers ====================
 void motorStop(void) {
@@ -185,6 +201,58 @@ void mapDecay(void) {
   }
 }
 
+// ==================== Passable channel (body-width aware) ====================
+// A direction idx is passable only if the whole channel centered on it is open:
+// every sector in the +-(PASS_SECTORS-1)/2 window reads >= CHANNEL_DIST.
+// This makes the car refuse gaps narrower than its own body.
+uint8_t passable(uint8_t idx) {
+  int8_t half = (int8_t)((PASS_SECTORS - 1) / 2);
+  for (int8_t k = -half; k <= half; k++) {
+    uint8_t s = (uint8_t)((idx + k + SECTOR_N) % SECTOR_N);
+    if (sector[s].dist < TURN_DIST) return 0;   // includes blind(0)/near obstacle
+  }
+  return 1;
+}
+
+// ==================== Iterative stuck-learning ====================
+void markStuck(uint8_t idx) {
+  for (int8_t k = -1; k <= 1; k++) {
+    uint8_t s = (uint8_t)((idx + k + SECTOR_N) % SECTOR_N);
+    if (stuck[s] < STUCK_MAX) stuck[s]++;
+  }
+}
+
+void stuckDecay(void) {
+  for (int i = 0; i < SECTOR_N; i++) {
+    if (stuck[i] > 0) stuck[i]--;
+  }
+}
+
+// nearest valid obstacle distance across all sectors (0/blind treated as open);
+// returns RANGE_MAX when nothing within range (fully open road)
+uint8_t nearestDist(void) {
+  uint8_t m = RANGE_MAX;
+  for (int i = 0; i < SECTOR_N; i++) {
+    uint8_t d = sector[i].dist;
+    if (d != 0 && d < m) m = d;
+  }
+  return m;
+}
+
+// refresh lastProgressMs ONLY on genuine forward progress: either the nearest
+// obstacle materially changed (real displacement) or the road is fully open.
+// A car wedged sideways (wheels spinning, front open) keeps nearest constant and
+// therefore does NOT refresh, so the STUCK_TIMEOUT watchdog fires and reverses it.
+void refreshProgress(void) {
+  uint8_t nn = nearestDist();
+  int16_t delta = (int16_t)nn - (int16_t)lastProgNearest;
+  if (delta < 0) delta = -delta;
+  if (nn == RANGE_MAX || delta >= PROGRESS_DELTA) {
+    lastProgressMs = millis();
+    lastProgNearest = nn;
+  }
+}
+
 // ==================== Moving scan (real-time guard only, never contour) ====================
 void scanTick(void) {
   unsigned long now = millis();
@@ -196,7 +264,7 @@ void scanTick(void) {
   sectorWrite((int8_t)(theta - 90), d);          // rel = theta - 90
 
   scanIdx++;
-  if (scanIdx >= SN_MAX) { scanIdx = 0; mapDecay(); }
+  if (scanIdx >= SN_MAX) { scanIdx = 0; mapDecay(); stuckDecay(); }
   myservo.write(SERVO_MIN + scanIdx * SCAN_STEP);
 }
 
@@ -249,25 +317,27 @@ void applyCalibration(void) {
   }
 }
 
-// ==================== Turn planning (sector-openness guided) ====================
+// ==================== Turn planning (passable-channel + stuck aware) ====================
 void planTurn(void) {
   uint8_t front = sector[secOffset].dist;
-  // B1: unknown(0) or open(>=TURN_DIST) => go straight, do not turn
-  if (front == 0 || front >= TURN_DIST) { planHeadIdx = secOffset; return; }
+  planHeadIdx = secOffset;
+  // B1: go straight only if front is known-open AND the channel is wide enough
+  if (front >= TURN_DIST && passable(secOffset)) { planHeadIdx = secOffset; return; }
   int8_t best = -1;
   uint16_t bestScore = 0xFFFF;
-  uint8_t bdir = (uint8_t)((secOffset + 1) % SECTOR_N);
+  uint8_t bdir = secOffset;
   for (int8_t i = 1; i < SECTOR_N; i++) {
     uint8_t idx = (uint8_t)((secOffset + i) % SECTOR_N);
+    if (!passable(idx)) continue;         // channel too narrow / blind / near obstacle
+    if (stuck[idx] > 0) continue;         // B4: learned: this direction got us stuck
     uint8_t d = sector[idx].dist;
-    if (d == 0) continue;                 // B2: unknown/blind sector never chosen
-    if (d < TURN_DIST) continue;          // not passable
+    if (d < TURN_DIST) continue;          // not passable distance
     int16_t off = sectorCenter(i);
     if (off < 0) off = -off;              // absolute offset from front
     uint16_t score = (uint16_t)d * 2 - (uint16_t)off * 1;   // dist wt 2, off wt 1
     if (score < bestScore) { bestScore = score; best = idx; bdir = idx; }
   }
-  if (best < 0) { enterDisengage(); return; }   // B2: all blocked => disengage, no probe loop
+  if (best < 0) { enterDisengage(); return; }   // B2: all blocked => disengage
   planHeadIdx = bdir;
 }
 
@@ -293,7 +363,7 @@ void capRefTick(void) {
     // scan done: plan turn on clean data
     planTurn();
     turnStep = ringStep(secOffsetOld, planHeadIdx);
-    if (turnStep == 0) { turnCount = 0; state = ST_FORWARD; motorForward(SPD_HIGH); }
+    if (turnStep == 0) { turnCount = 0; state = ST_FORWARD; motorForward(SPD_HIGH); refreshProgress(); }
     else { turnCount++; enterTurn(); }          // command motor, go TURN
   }
 }
@@ -328,9 +398,10 @@ void capNewTick(void) {
 
 // ==================== Disengage (stronger than BACKUP) ====================
 void enterDisengage(void) {
+  markStuck(planHeadIdx);               // remember the direction that failed
   disengCount++;
   unsigned long dMs = DISENGAGE_MS;
-  if (disengCount >= DISENGAGE_MAX) dMs *= 2;
+  if (disengCount >= DISENGAGE_MAX) dMs *= 2;   // escalate reverse duration
   moveStartMs = millis();
   disengUntilMs = moveStartMs + dMs;
   motorStop();
@@ -352,6 +423,8 @@ void verifyAfterTurn(void) {
   uint8_t front = sector[secOffset].dist;
   if (front >= FREESPACE) {
     turnCount = 0; disengCount = 0;   // cleared the obstacle: reset disengage streak
+    lastProgressMs = millis();        // real forward event
+    lastProgNearest = nearestDist();
     state = ST_FORWARD;
     return;
   }
@@ -376,9 +449,12 @@ void setup(void) {
   motorStop();
   for (int i = 0; i < SECTOR_N; i++) { sector[i].dist = 0; sector[i].count = 0; }
   for (int i = 0; i < SECTOR_N; i++) { refContour[i] = 0; newContour[i] = 0; }
+  for (int i = 0; i < SECTOR_N; i++) { stuck[i] = 0; }
   scanIdx = 0;
   myservo.write(SERVO_MIN);
   lastScanMs = millis();
+  lastProgressMs = millis();
+  lastProgNearest = nearestDist();
 }
 
 // ==================== Main loop ====================
@@ -387,12 +463,29 @@ void loop(void) {
 
   uint8_t front = sector[secOffset].dist;
 
-  // global guard: too close ahead => immediate stop
+  // global guard: too close ahead => immediate stop (with HALT_TIMEOUT escape).
+  // During a deliberate reverse-escape (ST_DISENGAGE) do NOT re-halt, let it back out.
   if (front > 0 && front <= WALL_STOP) {
-    if (state != ST_HALT) { motorStop(); state = ST_HALT; }
-    return;
+    if (state != ST_HALT && state != ST_DISENGAGE) {
+      motorStop(); haltStartMs = millis(); state = ST_HALT;
+    }
+  } else if (state == ST_HALT) {
+    state = ST_FORWARD;              // obstacle cleared; resume (real forward event)
+    lastProgressMs = millis();
+    lastProgNearest = nearestDist();
   }
-  if (state == ST_HALT) { state = ST_FORWARD; }   // clear guard
+
+  // C: no real forward progress for too long in any non-reversing state => reverse
+  if ((unsigned long)(millis() - lastProgressMs) > STUCK_TIMEOUT) {
+    if (state != ST_DISENGAGE && state != ST_HALT) {
+      enterDisengage();             // unconditional forced reverse (car stuck)
+    }
+  }
+  // R1-1: dead-stopped at a wall longer than HALT_TIMEOUT => forced reverse escape
+  if (state == ST_HALT &&
+      (unsigned long)(millis() - haltStartMs) > HALT_TIMEOUT) {
+    enterDisengage();
+  }
 
   switch (state) {
     case ST_SCAN:
@@ -400,16 +493,17 @@ void loop(void) {
       if (front <= SLOW_DIST) state = ST_DECEL;
       else {
         motorForward(SPD_HIGH);
-        disengCount = 0;              // normal advance => reset disengage streak
+        disengCount = 0;            // normal advance => reset disengage streak
+        refreshProgress();          // real forward event (open road or displacement)
       }
       break;
 
     case ST_DECEL:
-      if (front > SLOW_DIST + HYST) state = ST_FORWARD;   // hysteresis
+      if (front > SLOW_DIST + HYST) { state = ST_FORWARD; refreshProgress(); }
       else if (front > 0 && front <= TURN_DIST) {         // B1: only turn on real near obstacle
         enterCapRef();
       }
-      else motorForward(SPD_LOW);
+      else { motorForward(SPD_LOW); refreshProgress(); }  // slow approach is real progress
       break;
 
     case ST_CAPREF:
